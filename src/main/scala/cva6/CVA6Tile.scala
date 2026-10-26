@@ -32,7 +32,21 @@ import freechips.rocketchip.tile._
 import freechips.rocketchip.amba.axi4._
 
 object CVA6ConfigPackageGenerator {
-  def generatePackage(params: CVA6CoreParams, targetPath: String): Unit = {
+  def generatePackage(params: CVA6CoreParams, targetPath: String,
+                      cacheBases: Seq[BigInt], cacheSizes: Seq[BigInt]): Unit = {
+    require(cacheBases.length == cacheSizes.length)
+    val cachedRegions = cacheBases.zip(cacheSizes).filter(_._2 > 0)
+    require(cachedRegions.length <= 16, "CVA6 supports at most 16 cacheable regions")
+    for ((base, size) <- cachedRegions) {
+      require(base >= 0 && base + size <= (BigInt(1) << 64), "Invalid cacheable region")
+    }
+    // Pack rule zero into the low 64 bits, as expected by config_pkg.
+    val cachedBasesSv = if (cachedRegions.isEmpty) "'0" else
+      cachedRegions.reverse.map { case (base, _) => s"64'h${base.toString(16)}" }
+        .mkString("1024'({", ", ", "})")
+    val cachedSizesSv = if (cachedRegions.isEmpty) "'0" else
+      cachedRegions.reverse.map { case (_, size) => s"64'h${size.toString(16)}" }
+        .mkString("1024'({", ", ", "})")
     val writer = new java.io.FileWriter(new File(targetPath))
     
     val dCacheTypeSv = if (params.dCacheType == "WT") "config_pkg::WT" else "config_pkg::WB"
@@ -148,9 +162,9 @@ package cva6_config_pkg;
       NrExecuteRegionRules: 0,    
       ExecuteRegionAddrBase: '0,  
       ExecuteRegionLength: '0,    
-      NrCachedRegionRules: 0,     
-      CachedRegionAddrBase: '0,   
-      CachedRegionLength: '0,     
+      NrCachedRegionRules: unsigned'(${cachedRegions.length}),
+      CachedRegionAddrBase: $cachedBasesSv,
+      CachedRegionLength: $cachedSizesSv,
 
       // --- Interface & Bus ---
       CvxifEn: bit'(CVA6ConfigCvxifEn),
@@ -383,7 +397,6 @@ class CVA6Tile private(
   override lazy val module = new CVA6TileModuleImp(this)
   
   val svPath = "generators/cva6/src/main/resources/cva6/vsrc/cva6_config_pkg.sv"
-  CVA6ConfigPackageGenerator.generatePackage(cva6Params.core, svPath)
 
   /**
    * Setup AXI4 memory interface.
@@ -423,8 +436,10 @@ class CVA6Tile private(
 class CVA6TileModuleImp(outer: CVA6Tile) extends BaseTileModuleImp(outer){
   val debugBaseAddr = BigInt(0x0) // CONSTANT: based on default debug module
   val debugSz = BigInt(0x1000) // CONSTANT: based on default debug module
-  val tohostAddr = BigInt(0x80001000L) // CONSTANT: based on default sw (assume within extMem region)
-  val fromhostAddr = BigInt(0x80001040L) // CONSTANT: based on default sw (assume within extMem region)
+  // raw-evolution links .htif (tohost, then fromhost) here; keep equal to HTIF_ADDRESS in its config.py.
+  val tohostAddr = BigInt(0x80100000L)
+  // Leave the whole 4 KiB page uncached, so no cache line mixes tohost/fromhost with cached data.
+  val htifEnd = tohostAddr + 0x1000
 
   // have the main memory, bootrom, debug regions be executable
   val bootromParams = p(BootROMLocated(InSubsystem)).head
@@ -440,11 +455,14 @@ class CVA6TileModuleImp(outer: CVA6Tile) extends BaseTileModuleImp(outer){
     val sizes   = Seq(p(ExtMem).get.master.size, BigInt(0x0), BigInt(0x0), BigInt(0x0), BigInt(0x0))
     (bases, sizes)
   } else {
-    val bases = Seq(                                                          fromhostAddr + 0x40,              p(ExtMem).get.master.base, BigInt(0x0), BigInt(0x0), BigInt(0x0))
-    val sizes = Seq(p(ExtMem).get.master.size - (fromhostAddr + 0x40 - p(ExtMem).get.master.base), tohostAddr - p(ExtMem).get.master.base, BigInt(0x0), BigInt(0x0), BigInt(0x0))
+    val bases = Seq(                                                          htifEnd,              p(ExtMem).get.master.base, BigInt(0x0), BigInt(0x0), BigInt(0x0))
+    val sizes = Seq(p(ExtMem).get.master.size - (htifEnd - p(ExtMem).get.master.base), tohostAddr - p(ExtMem).get.master.base, BigInt(0x0), BigInt(0x0), BigInt(0x0))
     (bases, sizes)
   }
   val cacheableRegionCnt   = cacheableRegionBases.length
+
+  CVA6ConfigPackageGenerator.generatePackage(
+    outer.cva6Params.core, outer.svPath, cacheableRegionBases, cacheableRegionSzs)
 
   // Add 2 to account for the extra clock and reset included with each
   // instruction in the original trace port implementation. These have since
